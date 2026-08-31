@@ -1,7 +1,7 @@
 import os
 import datetime
 import asyncio
-import pytz
+from zoneinfo import ZoneInfo
 import discord
 from discord.ext import commands, tasks
 from discord.ui import View, Button, Modal, TextInput, UserSelect, Select
@@ -12,8 +12,8 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- ضبط المنطقة الزمنية (مصر) ---
-EGYPT_TZ = pytz.timezone("Africa/Cairo")
+# --- ضبط المنطقة الزمنية (مصر) باستخدام المكتبة المدمجة في بايثون ---
+EGYPT_TZ = ZoneInfo("Africa/Cairo")
 
 # --- آيديهات الرومات والرولات المحددة ---
 SHIFT_CHANNEL_ID   = 1542004969983574066  # روم المناوبات
