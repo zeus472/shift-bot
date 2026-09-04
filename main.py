@@ -37,7 +37,7 @@ staff_vacations = {}# {user_id: {"reason": str, "days": str, "start": str}}
 staff_excuse_count = {} # {user_id: int}
 max_weekly_excuses = 3
 shift_counter = 1
-bot_audit_logs = []  # سجل عمليات البوت
+bot_audit_logs = []  # قائمة لتخزين السجلات: [{"timestamp": datetime, "text": str}]
 
 def is_admin(interaction: discord.Interaction) -> bool:
     """التحقق من أن المستخدم يملك إحدى رولات الإدارة العليا"""
@@ -45,9 +45,14 @@ def is_admin(interaction: discord.Interaction) -> bool:
     return any(role_id in user_role_ids for role_id in ALLOWED_ROLES)
 
 def log_action(action_text: str, executor: discord.User):
-    """تسجيل العمليات في سجل البوت"""
-    now = datetime.datetime.now(EGYPT_TZ).strftime("%Y-%m-%d %H:%M")
-    bot_audit_logs.append(f"[{now}] 👤 {executor.mention}: {action_text}")
+    """تسجيل العمليات في سجل البوت مع التاريخ والوقت"""
+    now = datetime.datetime.now(EGYPT_TZ)
+    now_str = now.strftime("%Y-%m-%d %H:%M")
+    log_entry = {
+        "timestamp": now,
+        "text": f"[{now_str}] 👤 {executor.mention}: {action_text}"
+    }
+    bot_audit_logs.append(log_entry)
 
 # ==================== Modals (النماذج المنبثقة) ====================
 
@@ -68,7 +73,7 @@ class AddShiftModal(Modal, title="إضافة / تعديل مناوبة"):
             shifts[self.shift_id]["name"] = self.shift_name.value
             shifts[self.shift_id]["time"] = self.shift_time.value
             log_action(f"تعديل مناوبة `{self.shift_name.value}`", interaction.user)
-            await interaction.response.send_message(f"✅ تم تعديل المناوبة بنجاح!", ephemeral=True)
+            await interaction.response.send_message("✅ تم تعديل المناوبة بنجاح!", ephemeral=True)
         else:
             s_id = str(shift_counter)
             shifts[s_id] = {
@@ -145,8 +150,28 @@ class SetMaxExcusesModal(Modal, title="تعديل الحد الأقصى للاع
         except ValueError:
             await interaction.response.send_message("❌ يرجى كتابة رقم صحيح.", ephemeral=True)
 
-class SendBotMessageModal(Modal, title="إرسال رسالة باسم البوت"):
-    message_content = TextInput(label="محتوى الرسالة", style=discord.TextStyle.paragraph, placeholder="اكتب نص الرسالة هنا...", required=True)
+class RemoveSpecificWarningModal(Modal, title="خصم تحذيرات من إداري"):
+    count_to_remove = TextInput(label="عدد التحذيرات المراد إزالتها", placeholder="مثال: 1", required=True)
+
+    def __init__(self, target_id):
+        super().__init__()
+        self.target_id = target_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            rem_count = int(self.count_to_remove.value)
+            current = staff_warnings.get(self.target_id, 0)
+            new_count = max(0, current - rem_count)
+            staff_warnings[self.target_id] = new_count
+            
+            log_action(f"إزالة {rem_count} تحذير من الإداري <@{self.target_id}> (المتبقي: {new_count})", interaction.user)
+            await interaction.response.send_message(f"✅ تم خصم {rem_count} تحذير من <@{self.target_id}>. التحذيرات المتبقية: **{new_count}**", ephemeral=True)
+        except ValueError:
+            await interaction.response.send_message("❌ يرجى كتابة رقم صحيح.", ephemeral=True)
+
+# نماذج إرسال الرسائل (نص عادي + Embed احترافي)
+class SendNormalMessageModal(Modal, title="إرسال رسالة نصية"):
+    message_content = TextInput(label="محتوى الرسالة (يدعم المنشن والروابط)", style=discord.TextStyle.paragraph, placeholder="اكتب رسالتك هنا...", required=True)
 
     def __init__(self, channel_id):
         super().__init__()
@@ -156,10 +181,35 @@ class SendBotMessageModal(Modal, title="إرسال رسالة باسم البو�
         target_channel = bot.get_channel(self.channel_id)
         if target_channel:
             await target_channel.send(content=self.message_content.value)
-            log_action(f"إرسال رسالة عبر البوت في الروم <#{self.channel_id}>", interaction.user)
+            log_action(f"إرسال رسالة نصية في الروم <#{self.channel_id}>", interaction.user)
             await interaction.response.send_message("✅ تم إرسال الرسالة بنجاح!", ephemeral=True)
-        else:
-            await interaction.response.send_message("❌ تعذر العثور على الروم المحددة.", ephemeral=True)
+
+class SendEmbedMessageModal(Modal, title="إرسال رسالة Embed (شكل احترافي)"):
+    embed_title = TextInput(label="عنوان الرسالة (Title)", placeholder="مثال: قوانين سيرفر الديسكورد", required=False)
+    embed_description = TextInput(label="نص الرسالة / القوانين", style=discord.TextStyle.paragraph, placeholder="اكتب تفاصيل الرسالة هنا...", required=True)
+    thumb_url = TextInput(label="رابط صورة اللوجو الصغير (Thumbnail)", placeholder="رابط صورة مباشر (اختياري)", required=False)
+    img_url = TextInput(label="رابط صورة كبيرة أسفل الرسالة", placeholder="رابط صورة مباشر (اختياري)", required=False)
+
+    def __init__(self, channel_id):
+        super().__init__()
+        self.channel_id = channel_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        target_channel = bot.get_channel(self.channel_id)
+        if target_channel:
+            embed = discord.Embed(
+                title=self.embed_title.value if self.embed_title.value else None,
+                description=self.embed_description.value,
+                color=discord.Color.dark_red()
+            )
+            if self.thumb_url.value:
+                embed.set_thumbnail(url=self.thumb_url.value)
+            if self.img_url.value:
+                embed.set_image(url=self.img_url.value)
+
+            await target_channel.send(embed=embed)
+            log_action(f"إرسال رسالة Embed احترافية في الروم <#{self.channel_id}>", interaction.user)
+            await interaction.response.send_message("✅ تم إرسال رسالة الـ Embed بنجاح!", ephemeral=True)
 
 # ==================== Views (الأزرار والواجهات) ====================
 
@@ -184,18 +234,15 @@ class ShiftNotificationView(View):
             await interaction.response.send_message("❌ أنت لست مسجلاً في هذه المناوبة.", ephemeral=True)
             return
 
-        # إذا تأكد حضوره سابقاً
         if user_id in shift["confirmed"]:
             await interaction.response.send_message("ℹ️ تم تأكيد حضورك بالفعل ولا يمكنك تغيير حالتك.", ephemeral=True)
             return
 
-        # إذا كان لديه اعتذار (قيد الانتظار أو مقبول)
         ex = shift["excuses"].get(user_id)
         if ex and ex["status"] in ["قيد المراجعة", "مقبول"]:
             await interaction.response.send_message("❌ لديك طلب اعتذار قائم أو مقبول، لا يمكنك تأكيد الحضور إلا في حالة رفض الاعتذار.", ephemeral=True)
             return
 
-        # تأكيد الحضور
         shift["confirmed"].append(user_id)
         if user_id in shift["excuses"]:
             del shift["excuses"][user_id]
@@ -216,18 +263,15 @@ class ShiftNotificationView(View):
             await interaction.response.send_message("❌ أنت لست مسجلاً في هذه المناوبة.", ephemeral=True)
             return
 
-        # إذا أكد حضوره يمنع من الاعتذار
         if user_id in shift["confirmed"]:
             await interaction.response.send_message("❌ لقد قمت بتأكيد حضورك بالفعل ولا يمكنك تقديم اعتذار الآن.", ephemeral=True)
             return
 
-        # التحقق من الاعتذار القائم
         ex = shift["excuses"].get(user_id)
         if ex and ex["status"] in ["قيد المراجعة", "مقبول"]:
             await interaction.response.send_message("ℹ️ لديك طلب اعتذار قيد المراجعة أو مقبول بالفعل.", ephemeral=True)
             return
 
-        # فحص استنفاذ الاعتذارات الأسبوعية
         current_excuses = staff_excuse_count.get(user_id, 0)
         if current_excuses >= max_weekly_excuses:
             await interaction.response.send_message(f"❌ لقد استنفذت الحد الأقصى للاعتذارات الأسبوعية المسموحة لك ({max_weekly_excuses}). لن يتم قبول اعتذارك.", ephemeral=True)
@@ -363,7 +407,7 @@ class AdminBotControlView(View):
         view.add_item(btn_cancel_vac)
         await interaction.response.send_message("🏖️ **إدارة العطلات للإداريين:**", view=view, ephemeral=True)
 
-    # 4. سجل الإداريين
+    # 4. سجل الإداريين (مع تصفير إداري واحد أو خصم تحذيرات محددة)
     @discord.ui.button(label="سجل الإداريين", style=discord.ButtonStyle.secondary, emoji="📁", row=1)
     async def btn_staff_log(self, interaction: discord.Interaction, button: Button):
         if not is_admin(interaction):
@@ -378,13 +422,57 @@ class AdminBotControlView(View):
         embed.add_field(name="🏖️ الإداريين المجازين حالياً:", value=vac_text, inline=False)
 
         view = View()
-        btn_reset_all = Button(label="تصفير جميع التحذيرات", style=discord.ButtonStyle.danger)
+
+        # زر تصفير جميع التحذيرات
+        btn_reset_all = Button(label="تصفير تحذيرات الجميع", style=discord.ButtonStyle.danger, emoji="⚠️")
         async def r_all_cb(i):
             staff_warnings.clear()
             log_action("تصفير جميع تحذيرات الإداريين", i.user)
             await i.response.send_message("✅ تم تصفير جميع التحذيرات لكل الإداريين.", ephemeral=True)
         btn_reset_all.callback = r_all_cb
+
+        # زر التحكم بتحذيرات إداري محدد
+        btn_manage_user_warn = Button(label="تعديل تحذيرات إداري محدد", style=discord.ButtonStyle.primary, emoji="👤")
+        async def m_usr_w_cb(i):
+            active_warned = [uid for uid, c in staff_warnings.items() if c > 0]
+            if not active_warned:
+                await i.response.send_message("لا يوجد إداريين لديهم تحذيرات حالياً.", ephemeral=True)
+                return
+            
+            w_options = [discord.SelectOption(label=f"إداري ID: {uid} (التحذيرات: {staff_warnings[uid]})", value=str(uid)) for uid in active_warned]
+            w_select = Select(placeholder="اختر الإداري...", options=w_options)
+            
+            async def w_sel_cb(inter):
+                target_uid = int(w_select.values[0])
+                
+                sub_v = View()
+                # تصفير الكل لهذا اللاعب
+                btn_clear_single = Button(label="تصفير تحذيراته بالكامل", style=discord.ButtonStyle.danger)
+                async def clr_s_cb(inter_i):
+                    staff_warnings[target_uid] = 0
+                    log_action(f"تصفير تحذيرات الإداري <@{target_uid}> بالكامل", inter_i.user)
+                    await inter_i.response.send_message(f"✅ تم تصفير كافة تحذيرات الإداري <@{target_uid}>.", ephemeral=True)
+                btn_clear_single.callback = clr_s_cb
+
+                # خصم عدد محدد من التحذيرات
+                btn_rem_specific = Button(label="خصم عدد محدد من التحذيرات", style=discord.ButtonStyle.secondary)
+                async def rem_s_cb(inter_i):
+                    await inter_i.response.send_modal(RemoveSpecificWarningModal(target_uid))
+                btn_rem_specific.callback = rem_s_cb
+
+                sub_v.add_item(btn_clear_single)
+                sub_v.add_item(btn_rem_specific)
+                await inter.response.send_message(f"التحكم بتحذيرات الإداري <@{target_uid}> (الحالية: {staff_warnings[target_uid]}):", view=sub_v, ephemeral=True)
+
+            w_select.callback = w_sel_cb
+            w_view = View()
+            w_view.add_item(w_select)
+            await i.response.send_message("اختر الإداري للتحكم بتحذيراته:", view=w_view, ephemeral=True)
+
+        btn_manage_user_warn.callback = m_usr_w_cb
+
         view.add_item(btn_reset_all)
+        view.add_item(btn_manage_user_warn)
 
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
@@ -404,13 +492,11 @@ class AdminBotControlView(View):
 
         view = View()
 
-        # زر تعديل حد الاعتذارات
         btn_set_max = Button(label="تعديل الحد الأقصى", style=discord.ButtonStyle.primary, emoji="✏️")
         async def set_max_cb(i):
             await i.response.send_modal(SetMaxExcusesModal())
         btn_set_max.callback = set_max_cb
 
-        # زر تصفير الاعتذارات للجميع
         btn_reset_all_ex = Button(label="تصفير اعتذارات الجميع", style=discord.ButtonStyle.danger, emoji="🔄")
         async def r_ex_cb(i):
             staff_excuse_count.clear()
@@ -418,12 +504,8 @@ class AdminBotControlView(View):
             await i.response.send_message("✅ تم تصفير سجل الاعتذارات الأسبوعية لجميع الإداريين.", ephemeral=True)
         btn_reset_all_ex.callback = r_ex_cb
 
-        # زر تصفير اعتذارات إداري محدد
         btn_reset_user_ex = Button(label="تصفير اعتذارات إداري محدد", style=discord.ButtonStyle.secondary, emoji="👤")
         async def r_usr_cb(i):
-            if not staff_excuse_count:
-                await i.response.send_message("لا يوجد إداريين لديهم اعتذارات مسجلة.", ephemeral=True)
-                return
             u_options = [discord.SelectOption(label=f"إداري ID: {uid} ({cnt})", value=str(uid)) for uid, cnt in staff_excuse_count.items() if cnt > 0]
             if not u_options:
                 await i.response.send_message("لا يوجد إداريين لديهم اعتذارات مسجلة.", ephemeral=True)
@@ -453,11 +535,12 @@ class AdminBotControlView(View):
             await interaction.response.send_message("❌ هذه اللوحة مخصصة للإدارة العليا فقط.", ephemeral=True)
             return
 
-        log_text = "\n".join(bot_audit_logs[-15:]) or "لا توجد عمليات مسجلة حديثاً في البوت."
-        embed = discord.Embed(title="📜 سجل عمليات البوت الإدارية", description=log_text, color=discord.Color.dark_gray())
+        logs_list = [entry["text"] for entry in bot_audit_logs[-15:]]
+        log_text = "\n".join(logs_list) or "لا توجد عمليات مسجلة حديثاً في البوت."
+        embed = discord.Embed(title="📜 سجل عمليات البوت الإدارية (تلقائي المسح كل 7 أيام)", description=log_text, color=discord.Color.dark_gray())
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    # 7. إرسال رسالة
+    # 7. إرسال رسالة (عادية أو Embed)
     @discord.ui.button(label="إرسال رسالة", style=discord.ButtonStyle.primary, emoji="📢", row=2)
     async def btn_send_msg(self, interaction: discord.Interaction, button: Button):
         if not is_admin(interaction):
@@ -465,11 +548,28 @@ class AdminBotControlView(View):
             return
 
         c_select = ChannelSelect(placeholder="اختر الروم لإرسال الرسالة فيها...", channel_types=[discord.ChannelType.text])
+        
         async def c_sel_cb(inter):
             target_chan_id = c_select.values[0].id
-            await inter.response.send_modal(SendBotMessageModal(target_chan_id))
-        c_select.callback = c_sel_cb
+            
+            # خيارات نوع الرسالة
+            type_view = View()
+            btn_norm = Button(label="رسالة نصية عادية", style=discord.ButtonStyle.primary)
+            async def norm_cb(i_n):
+                await i_n.response.send_modal(SendNormalMessageModal(target_chan_id))
+            btn_norm.callback = norm_cb
 
+            btn_emb = Button(label="رسالة Embed (مثل الصورة)", style=discord.ButtonStyle.success)
+            async def emb_cb(i_e):
+                await i_e.response.send_modal(SendEmbedMessageModal(target_chan_id))
+            btn_emb.callback = emb_cb
+
+            type_view.add_item(btn_norm)
+            type_view.add_item(btn_emb)
+
+            await inter.response.send_message("اختر نوع الرسالة التي تريد إرسالها:", view=type_view, ephemeral=True)
+
+        c_select.callback = c_sel_cb
         v = View()
         v.add_item(c_select)
         await interaction.response.send_message("اختر الروم المطلوب الإرسال فيها:", view=v, ephemeral=True)
@@ -519,14 +619,14 @@ class UserAssignSelectView(View):
                 log_action(f"تسكين الإداري <@{uid}> في مناوبة `{shift['name']}`", interaction.user)
                 await interaction.response.send_message(f"✅ تم تسكين <@{uid}> في مناوبة `{shift['name']}` بنجاح!", ephemeral=True)
             else:
-                await interaction.response.send_message(f"ℹ️ الإداري مضاف بالفعل في هذه المناوبة.", ephemeral=True)
+                await interaction.response.send_message("ℹ️ الإداري مضاف بالفعل في هذه المناوبة.", ephemeral=True)
         else:
             if uid in shift["staff"]:
                 shift["staff"].remove(uid)
                 log_action(f"إلغاء تسكين الإداري <@{uid}> من مناوبة `{shift['name']}`", interaction.user)
                 await interaction.response.send_message(f"🗑️ تم إلغاء تسكين <@{uid}> من مناوبة `{shift['name']}` بنجاح!", ephemeral=True)
             else:
-                await interaction.response.send_message(f"ℹ️ الإداري غير موجود في هذه المناوبة.", ephemeral=True)
+                await interaction.response.send_message("ℹ️ الإداري غير موجود في هذه المناوبة.", ephemeral=True)
 
 # ==================== المساعدات والدوال التلقائية والتوقيت ====================
 
@@ -576,7 +676,6 @@ async def shift_scheduler():
         return
 
     for s_id, data in list(shifts.items()):
-        # بدء المناوبة في وقتها المحدد
         if data["time"] == now_str and not data.get("active_msg_id"):
             data["closed"] = False
             data["confirmed"] = []
@@ -599,18 +698,15 @@ async def shift_scheduler():
             asyncio.create_task(handle_shift_timeout(s_id))
 
 async def handle_shift_timeout(shift_id):
-    # الانتظار لمدة 10 دقائق (600 ثانية)
-    await asyncio.sleep(600)
+    await asyncio.sleep(600)  # 10 دقائق
     
     shift = shifts.get(shift_id)
     if not shift:
         return
 
-    # قفل الأزرار في المناوبة
     shift["closed"] = True
     await update_shift_embed(shift_id)
 
-    # معالجة التحذيرات للإداريين المقصرين
     warning_channel = bot.get_channel(WARNING_CHANNEL_ID)
 
     for uid in shift["staff"]:
@@ -624,7 +720,6 @@ async def handle_shift_timeout(shift_id):
         if ex and ex["status"] == "مقبول":
             continue
 
-        # تسجيل وتطبيق التحذير
         staff_warnings[uid] = staff_warnings.get(uid, 0) + 1
         count = staff_warnings[uid]
 
@@ -634,10 +729,19 @@ async def handle_shift_timeout(shift_id):
             else:
                 await warning_channel.send(content=f"⚠️ الإداري <@{uid}> حصل على تحذير ({count}/3) بسبب التغيب عن مناوبة `{shift['name']}`.")
 
-    # إعادة تهيئة المناوبة لتعمل مجدداً في اليوم التالي
-    await asyncio.sleep(120)  # الانتظار دقيقتين لضمان تغير دقيقة التوقيت
+    await asyncio.sleep(120)
     shift["active_msg_id"] = None
     shift["closed"] = False
+
+# مهمة تنظيف السجلات الأقدم من 7 أيام تلقائياً
+@tasks.loop(hours=6)
+async def clear_old_audit_logs():
+    now = datetime.datetime.now(EGYPT_TZ)
+    global bot_audit_logs
+    bot_audit_logs = [
+        entry for entry in bot_audit_logs 
+        if (now - entry["timestamp"]).days < 7
+    ]
 
 class MainSetupView(View):
     def __init__(self):
@@ -670,5 +774,7 @@ async def on_ready():
     print(f"Bot connected as {bot.user}")
     if not shift_scheduler.is_running():
         shift_scheduler.start()
+    if not clear_old_audit_logs.is_running():
+        clear_old_audit_logs.start()
 
 bot.run(os.getenv("DISCORD_TOKEN"))
