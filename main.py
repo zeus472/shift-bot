@@ -558,12 +558,18 @@ class RateProductModal(ui.Modal, title="⭐ تقييم منتجات المتجر
         stars_str = "⭐" * stars_num
         ratings_channel = interaction.guild.get_channel(CHANNEL_RATINGS_ID)
 
-        if ratings_channel:
-            embed_review = discord.Embed(
-                title="🌟 │ تقييم مراجعة جديد للمتجر",
-                description=(
-                    f"👤 **صاحب التقييم:** {interaction.user.mention}\n"
-                    f"📦 **المنتج:** `{self.prod_info.value}`\n"
-                    f"⭐ **التقييم:** {stars_str} (`{stars_num}/5`)\n\n"
-                    f"📝 **الرأي والتفاصيل:**\n```{self.review.value}
+            if ratings_channel:
+        embed_review = discord.Embed(
+            title="🌟 تقييم جديد للمتجر",
+            description=(
+                f"**صاحب التقييم:** {interaction.user.mention}\n"
+                f"**المنتج:** `{self.prod_info.value}`\n"
+                f"**التقييم:** {stars_str} ({stars_num}/5)\n"
+                f"**الرأي والتفاصيل:**\n```{self.review.value}```"
+            ),
+            color=0x2ECC71
+        )
+        await ratings_channel.send(embed=embed_review)
+        await interaction.response.send_message("تم إرسال تقييمك بنجاح، شكراً لك!", ephemeral=True)
+
 bot.run(os.getenv("DISCORD_TOKEN"))
