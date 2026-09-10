@@ -717,5 +717,15 @@ async def setup_admin(ctx):
         color=0xE74C3C
     )
     await ctx.send(embed=embed, view=AdminPanelView())
+@bot.command()
+async def ping(ctx):
+    await ctx.send("Pong! 🏓 البوت شغال وبيستجيب للأوامر.")
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ **خطأ:** تحتاج صلاحية Administrator لتنفيذ هذا الأمر.")
+    else:
+        await ctx.send(f"❌ **حدث خطأ:** `{error}`")
 
 bot.run(os.getenv("DISCORD_TOKEN"))
