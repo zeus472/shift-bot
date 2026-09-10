@@ -689,34 +689,32 @@ async def on_voice_state_update(member, before, after):
 # ==================== أوامر إرسال اللوحات ====================
 
 @bot.command()
-@commands.has_permissions(administrator=True)
 async def setup_store(ctx):
     embed = discord.Embed(
-        title="🛍️ │ متجر Brevix الرسمي",
-        description="مرحباً بك في المتجر! اضغط على الأزرار أدناه للاستعراض والشراء.",
+        title="🛒 | متجر Brevix الرسمي",
+        description="أهلاً بك في المتجر! اضغط على الأزرار أدناه للاستعراض والشراء.",
         color=0xF1C40F
     )
     await ctx.send(embed=embed, view=StorePanelView())
 
 @bot.command()
-@commands.has_permissions(administrator=True)
 async def setup_user(ctx):
     embed = discord.Embed(
-        title="👤 │ لوحة خدمات الأعضاء",
+        title="👤 | لوحة خدمات الأعضاء",
         description="استخدم الأزرار أدناه للتحكم بملفك الشخصي وعجلة الحظ.",
         color=0x3498DB
     )
     await ctx.send(embed=embed, view=UserPanelView())
 
 @bot.command()
-@commands.has_permissions(administrator=True)
 async def setup_admin(ctx):
     embed = discord.Embed(
-        title="⚙️ │ لوحة التحكم الإدارية",
+        title="⚙️ | لوحة التحكم الإدارية",
         description="استخدم الأزرار أدناه لإدارة رصيد الأعضاء وإضافة المنتجات.",
         color=0xE74C3C
     )
     await ctx.send(embed=embed, view=AdminPanelView())
+
 @bot.command()
 async def ping(ctx):
     await ctx.send("Pong! 🏓 البوت شغال وبيستجيب للأوامر.")
