@@ -726,4 +726,8 @@ async def on_command_error(ctx, error):
     else:
         await ctx.send(f"❌ **حدث خطأ:** `{error}`")
 
+@bot.command()
+async def test(ctx):
+    await ctx.send("الأمر شغال تمام!")
+
 bot.run(os.getenv("DISCORD_TOKEN"))
