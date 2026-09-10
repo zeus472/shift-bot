@@ -7,26 +7,41 @@ import datetime
 import random
 import string
 import asyncio
+import os
+from dotenv import load_dotenv
 
-# ==================== الإعدادات الثابتة ====================
+# تحميل متغيرات البيئة
+load_dotenv()
+
+# ==================== الإعدادات والثوابت ====================
 ROLE_MEMBER_ID = 1541620051033985085
 CHANNEL_LEVELUP_ID = 1544834419544821780
 ROLE_STORE_TEAM_ID = 1547655214507622481
 CHANNEL_LOG_ID = 1547668485340012575
+CHANNEL_RATINGS_ID = 1547726880134664273
+CHANNEL_WHEEL_LOG_ID = 1547732226358120579
+
+ROLE_VIP_ID = 1541619810230730762
+ROLE_LUCKY_STAR_ID = 1547731648982945792
+
 CURRENCY_NAME = "BX COINS 🪙"
 
 # ==================== إعداد قاعدة البيانات ====================
 conn = sqlite3.connect("bot_database.db")
 cursor = conn.cursor()
 
+# جدول المستخدمين
 cursor.execute('''CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     messages INTEGER DEFAULT 0,
     voice_minutes INTEGER DEFAULT 0,
     level INTEGER DEFAULT 1,
-    coins INTEGER DEFAULT 0
+    coins INTEGER DEFAULT 0,
+    last_free_spin TEXT,
+    extra_free_spins INTEGER DEFAULT 0
 )''')
 
+# جدول متطلبات المستويات
 cursor.execute('''CREATE TABLE IF NOT EXISTS level_reqs (
     level INTEGER PRIMARY KEY,
     req_messages INTEGER DEFAULT 0,
@@ -34,27 +49,62 @@ cursor.execute('''CREATE TABLE IF NOT EXISTS level_reqs (
     reward_coins INTEGER DEFAULT 0
 )''')
 
+# جدول المنتجات
 cursor.execute('''CREATE TABLE IF NOT EXISTS products (
     code TEXT PRIMARY KEY,
     name TEXT,
     item_type TEXT,
     role_id INTEGER,
     price INTEGER,
-    duration_minutes INTEGER
+    original_price INTEGER DEFAULT 0,
+    duration_minutes INTEGER DEFAULT 0,
+    allowed_users TEXT DEFAULT 'ALL',
+    status TEXT DEFAULT 'available',
+    allow_coupons INTEGER DEFAULT 1,
+    allowed_coupon_perc INTEGER DEFAULT 0
 )''')
 
+# جدول الرتب المؤقتة
 cursor.execute('''CREATE TABLE IF NOT EXISTS temp_roles (
     user_id INTEGER,
     role_id INTEGER,
     expire_time TEXT
 )''')
+
+# جدول كوبونات الخصم
+cursor.execute('''CREATE TABLE IF NOT EXISTS user_coupons (
+    code TEXT PRIMARY KEY,
+    user_id INTEGER,
+    discount INTEGER,
+    is_used INTEGER DEFAULT 0
+)''')
+
+conn.commit()
+
+# التحديث التلقائي للهيكل لملاءمة القاعدة القديمة
+cols_to_add = [
+    ("users", "last_free_spin TEXT"),
+    ("users", "extra_free_spins INTEGER DEFAULT 0"),
+    ("products", "original_price INTEGER DEFAULT 0"),
+    ("products", "allowed_users TEXT DEFAULT 'ALL'"),
+    ("products", "status TEXT DEFAULT 'available'"),
+    ("products", "allow_coupons INTEGER DEFAULT 1"),
+    ("products", "allowed_coupon_perc INTEGER DEFAULT 0")
+]
+for table, col in cols_to_add:
+    try:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
+    except sqlite3.OperationalError:
+        pass
 conn.commit()
 
 # ==================== البوت والإنتنتس ====================
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# دالة السجل الشامل
 async def log_event(guild, title, description, color=0x3498DB):
+    if not guild: return
     log_channel = guild.get_channel(CHANNEL_LOG_ID)
     if log_channel:
         embed = discord.Embed(
@@ -63,34 +113,57 @@ async def log_event(guild, title, description, color=0x3498DB):
             color=color,
             timestamp=datetime.datetime.utcnow()
         )
-        embed.set_footer(text="نظام السجلات الآلي • Brevix Logs", icon_url=guild.icon.url if guild.icon else None)
+        embed.set_footer(text="نظام السجلات الشامل • Brevix Logs", icon_url=guild.icon.url if guild.icon else None)
         await log_channel.send(embed=embed)
 
+# دالة سجل عجلة الحظ المخصص
+async def log_wheel_event(guild, user, spin_type, cost_text, prize_name, coins_left):
+    if not guild: return
+    wheel_log_chan = guild.get_channel(CHANNEL_WHEEL_LOG_ID)
+    if wheel_log_chan:
+        embed = discord.Embed(
+            title="🎰 │ سجل عمليات عجلة الحظ",
+            description=(
+                f"👤 **العضو:** {user.mention} (`{user.id}`)\n"
+                f"🌀 **نوع اللفة:** `{spin_type}`\n"
+                f"💳 **التكلفة:** `{cost_text}`\n"
+                f"🎉 **الجائزة المكسوبة:** **{prize_name}**\n"
+                f"💰 **رصيد الكوينز المتبقي:** `{coins_left}` {CURRENCY_NAME}\n"
+                f"▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
+            ),
+            color=0x9B59B6,
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed.set_thumbnail(url=user.display_avatar.url)
+        embed.set_footer(text="حماية ومراقبة عجلة الحظ", icon_url=guild.icon.url if guild.icon else None)
+        await wheel_log_chan.send(embed=embed)
+
 def get_user_data(user_id):
-    cursor.execute("SELECT messages, voice_minutes, level, coins FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT messages, voice_minutes, level, coins, last_free_spin, extra_free_spins FROM users WHERE user_id = ?", (user_id,))
     data = cursor.fetchone()
     if not data:
         cursor.execute("INSERT INTO users (user_id) VALUES (?)", (user_id,))
         conn.commit()
-        return (0, 0, 1, 0)
+        return (0, 0, 1, 0, None, 0)
     return data
 
+# فحص الترقية (منطق الاختيار OR)
 async def check_level_up(member, channel=None):
     if not any(r.id == ROLE_MEMBER_ID for r in member.roles):
         return
-    msgs, v_mins, current_lvl, coins = get_user_data(member.id)
+    msgs, v_mins, current_lvl, coins, _, _ = get_user_data(member.id)
     next_lvl = current_lvl + 1
-    
-    if next_lvl > 100:
-        return
+    if next_lvl > 100: return
 
     cursor.execute("SELECT req_messages, req_voice_mins, reward_coins FROM level_reqs WHERE level = ?", (next_lvl,))
     req = cursor.fetchone()
-    if not req:
-        return
+    if not req: return
 
     req_msgs, req_vmins, reward = req
-    if msgs >= req_msgs and v_mins >= req_vmins:
+    msgs_condition = (req_msgs > 0 and msgs >= req_msgs)
+    vmins_condition = (req_vmins > 0 and v_mins >= req_vmins)
+
+    if msgs_condition or vmins_condition:
         new_coins = coins + reward
         cursor.execute("UPDATE users SET level = ?, coins = ? WHERE user_id = ?", (next_lvl, new_coins, member.id))
         conn.commit()
@@ -104,41 +177,41 @@ async def check_level_up(member, channel=None):
                     f"▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
                     f"📈 **المستوى الجديد:** `Level {next_lvl}`\n"
                     f"🎁 **المكافأة:** `{reward}` {CURRENCY_NAME}\n"
-                    f"▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
-                    f"استمر في التفاعل والمشاركة للوصول إلى المستويات التالية! 🔥"
+                    f"▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
                 ),
                 color=0xF1C40F
             )
             embed.set_thumbnail(url=member.display_avatar.url)
-            embed.set_footer(text="نظام المستويات الآلي", icon_url=member.guild.icon.url if member.guild.icon else None)
             await lvl_channel.send(content=member.mention, embed=embed)
 
-        await log_event(member.guild, "ترقية مستوى", f"اللاعب {member.mention} وصل إلى **Level {next_lvl}** وحصل على مكافأة `{reward}` كوينز.")
+        reason = "الرسائل النصية" if msgs_condition else "الدقائق الصوتية"
+        await log_event(member.guild, "ترقية مستوى تلقائية", f"اللاعب {member.mention} وصل إلى **Level {next_lvl}** بفضل ({reason}) وحصل على `{reward}` كوينز.")
         await check_level_up(member, channel)
 
 # ==================== اللوحات والعناصر التفاعلية ====================
 
-# --- لوحة المستخدم ---
+# --- 1. لوحة المستخدم ---
 class UserPanelView(ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @ui.button(label="استعلام عن الرصيد 💰", style=discord.ButtonStyle.primary, custom_id="btn_balance")
     async def balance(self, interaction: discord.Interaction, button: ui.Button):
-        _, _, _, coins = get_user_data(interaction.user.id)
+        _, _, _, coins, _, _ = get_user_data(interaction.user.id)
         embed = discord.Embed(
             title="💳 │ محفظتك المالية",
             description=f"مرحباً {interaction.user.mention}\n\n◈ **رصيدك الحالي:** `{coins}` {CURRENCY_NAME}",
             color=0x2ECC71
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+        await log_event(interaction.guild, "استعلام رصيد", f"قام {interaction.user.mention} بالاستعلام عن رصيده (`{coins}` كوينز).")
 
     @ui.button(label="المستوى والتفاعل 📊", style=discord.ButtonStyle.secondary, custom_id="btn_stats")
     async def stats(self, interaction: discord.Interaction, button: ui.Button):
-        msgs, v_mins, lvl, _ = get_user_data(interaction.user.id)
+        msgs, v_mins, lvl, _, _, _ = get_user_data(interaction.user.id)
         embed = discord.Embed(
             title="📊 │ إحصائيات التفاعل والمستوى",
-            description=f"أهلاً بك {interaction.user.mention}، إليك تفاصيل نشاطك داخل السيرفر:\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬",
+            description=f"أهلاً بك {interaction.user.mention}، إليك تفاصيل نشاطك:\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬",
             color=0x3498DB
         )
         embed.add_field(name="🏆 المستوى الحالي", value=f"`Level {lvl}`", inline=True)
@@ -151,6 +224,114 @@ class UserPanelView(ui.View):
     async def transfer(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_modal(TransferModal())
 
+    @ui.button(label="🎰 عجلة الحظ", style=discord.ButtonStyle.danger, custom_id="btn_wheel")
+    async def spin_wheel(self, interaction: discord.Interaction, button: ui.Button):
+        user_id = interaction.user.id
+        _, _, _, coins, last_spin, extra_spins = get_user_data(user_id)
+
+        now = datetime.datetime.utcnow()
+        cost_text = "مجانية"
+        spin_type = ""
+
+        if extra_spins > 0:
+            cursor.execute("UPDATE users SET extra_free_spins = extra_free_spins - 1 WHERE user_id = ?", (user_id,))
+            conn.commit()
+            spin_type = "لفة مجانية إضافية 🎁"
+            cost_text = "0 كوينز (إضافية)"
+        elif not last_spin or (now - datetime.datetime.fromisoformat(last_spin)).total_seconds() >= 86400:
+            cursor.execute("UPDATE users SET last_free_spin = ? WHERE user_id = ?", (now.isoformat(), user_id))
+            conn.commit()
+            spin_type = "لفة مجانية يومية 🌟"
+            cost_text = "0 كوينز (يومية)"
+        else:
+            if coins < 100:
+                embed_err = discord.Embed(
+                    title="❌ لا يمكن اللف",
+                    description="استنفذت لفتك المجانية اليومية! تكلفة اللفة الإضافية هي `100` BX COINS ورصيدك غير كافٍ.",
+                    color=0xE74C3C
+                )
+                return await interaction.response.send_message(embed=embed_err, ephemeral=True)
+            
+            cursor.execute("UPDATE users SET coins = coins - 100 WHERE user_id = ?", (user_id,))
+            conn.commit()
+            coins -= 100
+            spin_type = "لفة مدفوعة 🪙"
+            cost_text = "100 BX COINS"
+
+        prizes = [
+            {"type": "coupon", "val": 5, "name": "كوبون خصم 5%", "weight": 20},
+            {"type": "coupon", "val": 10, "name": "كوبون خصم 10%", "weight": 15},
+            {"type": "coupon", "val": 25, "name": "كوبون خصم 25%", "weight": 3},
+            {"type": "coupon", "val": 50, "name": "كوبون خصم 50%", "weight": 1},
+            {"type": "coupon", "val": 100, "name": "كوبون خصم 100%", "weight": 0.20},
+            {"type": "coins_rand", "val": [10, 20, 30], "name": "عملات BX COINS (10-30)", "weight": 80},
+            {"type": "coins", "val": 50, "name": "50 BX COINS 🪙", "weight": 30},
+            {"type": "coins", "val": 70, "name": "70 BX COINS 🪙", "weight": 20},
+            {"type": "coins", "val": 100, "name": "100 BX COINS 🪙", "weight": 3},
+            {"type": "coins", "val": 1000, "name": "1000 BX COINS 🪙", "weight": 0.05},
+            {"type": "extra_spin", "val": 1, "name": "لفة مجانية إضافية 🔄", "weight": 20},
+            {"type": "role", "val": ROLE_VIP_ID, "name": "رتبة VIP 👑", "weight": 1},
+            {"type": "role", "val": ROLE_LUCKY_STAR_ID, "name": "رتبة Lucky Star ⭐", "weight": 10},
+        ]
+
+        weights = [p["weight"] for p in prizes]
+        won_prize = random.choices(prizes, weights=weights, k=1)[0]
+        prize_display = ""
+
+        if won_prize["type"] == "coupon":
+            cpn_code = "CPN-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+            cursor.execute("INSERT INTO user_coupons VALUES (?, ?, ?, 0)", (cpn_code, user_id, won_prize["val"]))
+            conn.commit()
+            prize_display = f"كوبون خصم `{won_prize['val']}%` (كود الخصم: `{cpn_code}`)"
+
+        elif won_prize["type"] == "coins_rand":
+            amt = random.choice(won_prize["val"])
+            cursor.execute("UPDATE users SET coins = coins + ? WHERE user_id = ?", (amt, user_id))
+            conn.commit()
+            coins += amt
+            prize_display = f"`{amt}` {CURRENCY_NAME}"
+
+        elif won_prize["type"] == "coins":
+            amt = won_prize["val"]
+            cursor.execute("UPDATE users SET coins = coins + ? WHERE user_id = ?", (amt, user_id))
+            conn.commit()
+            coins += amt
+            prize_display = f"`{amt}` {CURRENCY_NAME}"
+
+        elif won_prize["type"] == "extra_spin":
+            cursor.execute("UPDATE users SET extra_free_spins = extra_free_spins + 1 WHERE user_id = ?", (user_id,))
+            conn.commit()
+            prize_display = "لفة مجانية إضافية جديدة 🔄"
+
+        elif won_prize["type"] == "role":
+            role = interaction.guild.get_role(won_prize["val"])
+            if role:
+                if role not in interaction.user.roles:
+                    await interaction.user.add_roles(role)
+                    prize_display = f"رتبة **{role.name}**"
+                else:
+                    cursor.execute("UPDATE users SET coins = coins + 150 WHERE user_id = ?", (user_id,))
+                    conn.commit()
+                    coins += 150
+                    prize_display = f"رتبة **{role.name}** (تم تعويضك بـ 150 كوينز لامتلاكك إياها)"
+
+        embed_result = discord.Embed(
+            title="🎰 │ نتائج عجلة الحظ",
+            description=(
+                f"أهلاً بك {interaction.user.mention}!\n\n"
+                f"🌀 **نوع اللفة:** `{spin_type}`\n"
+                f"🎉 **الجائزة المكسوبة:** **{prize_display}**\n\n"
+                f"▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
+                f"تم إضافة الجائزة إلى حسابك تلقائياً!"
+            ),
+            color=0x9B59B6
+        )
+        embed_result.set_thumbnail(url=interaction.user.display_avatar.url)
+        await interaction.response.send_message(embed=embed_result, ephemeral=True)
+
+        await log_wheel_event(interaction.guild, interaction.user, spin_type, cost_text, prize_display, coins)
+        await log_event(interaction.guild, "عجلة الحظ", f"قام {interaction.user.mention} بلف عجلة الحظ وحصل على: **{prize_display}**.")
+
 class TransferModal(ui.Modal, title="💸 تحويل BX COINS"):
     target_id = ui.TextInput(label="آي دي العضو المستلم", placeholder="مثال: 123456789", required=True)
     amount = ui.TextInput(label="المبلغ المراد تحويله", placeholder="مثال: 500", required=True)
@@ -159,13 +340,12 @@ class TransferModal(ui.Modal, title="💸 تحويل BX COINS"):
         try:
             target = int(self.target_id.value)
             amt = int(self.amount.value)
-            if amt <= 0:
-                raise ValueError
+            if amt <= 0: raise ValueError
         except ValueError:
             embed = discord.Embed(title="❌ خطأ", description="يرجى إدخال بيانات وأرقام صحيحة.", color=0xE74C3C)
             return await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        _, _, _, sender_coins = get_user_data(interaction.user.id)
+        _, _, _, sender_coins, _, _ = get_user_data(interaction.user.id)
         if sender_coins < amt:
             embed = discord.Embed(title="❌ رصيد غير كافٍ", description="لا تمتلك هذا القدر من العملات لإتمام التحويل.", color=0xE74C3C)
             return await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -183,14 +363,14 @@ class TransferModal(ui.Modal, title="💸 تحويل BX COINS"):
         await interaction.response.send_message(embed=embed, ephemeral=True)
         await log_event(interaction.guild, "تحويل عملات", f"قام {interaction.user.mention} بتحويل `{amt}` {CURRENCY_NAME} إلى <@{target}>.")
 
-# --- لوحة المتجر ---
+# --- 2. لوحة المتجر ---
 class StorePanelView(ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @ui.button(label="عرض المنتجات 🛍️", style=discord.ButtonStyle.primary, custom_id="btn_list_products")
     async def list_products(self, interaction: discord.Interaction, button: ui.Button):
-        cursor.execute("SELECT code, name, item_type, price, duration_minutes FROM products")
+        cursor.execute("SELECT code, name, item_type, price, original_price, duration_minutes, allowed_users, status, allow_coupons, allowed_coupon_perc FROM products")
         prods = cursor.fetchall()
         if not prods:
             embed = discord.Embed(title="🛒 │ المتجر فارغ", description="لا توجد منتجات متاحة للشراء حالياً.", color=0xE74C3C)
@@ -201,13 +381,28 @@ class StorePanelView(ui.View):
             description="إليك جميع المنتجات المتاحة حالياً، استخدم كود المنتج عند الشراء:\n▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬",
             color=0xF1C40F
         )
-        for code, name, itype, price, dur in prods:
+        for code, name, itype, price, orig_price, dur, allowed, status, allow_cpn, cpn_perc in prods:
             dur_str = f"`{dur}` دقيقة" if dur > 0 else "`دائم`"
-            p_str = "`مجاني`" if price == 0 else f"`{price}` {CURRENCY_NAME}"
-            type_str = "رتبة (Role)" if itype == "role" else "منتج آخر (Ticket)"
+            p_str = f"~~{orig_price}~~ **{price}** {CURRENCY_NAME} 🔥" if orig_price > price else f"`{price}` {CURRENCY_NAME}"
+
+            status_map = {"available": "✅ متوفر", "unavailable": "❌ غير متوفر حالياً", "coming_soon": "⏳ سيتوفر قريباً"}
+            status_str = status_map.get(status, "✅ متوفر")
+            allowed_str = "عام للجميع 🌐" if allowed == 'ALL' else "خاص لأشخاص محددين 🔒"
+
+            cpn_info = "مسموح 🎫" if allow_cpn == 1 else "ممنوع ❌"
+            if allow_cpn == 1 and cpn_perc > 0:
+                cpn_info = f"كوبون `{cpn_perc}%` فقط 🎯"
+
             embed.add_field(
                 name=f"📦 {name} │ الكود: [{code}]",
-                value=f"◈ **النوع:** {type_str}\n◈ **السعر:** {p_str}\n◈ **الصلاحية:** {dur_str}\n──────────────────",
+                value=(
+                    f"◈ **الحالة:** {status_str}\n"
+                    f"◈ **السعر:** {p_str}\n"
+                    f"◈ **الصلاحية:** {dur_str}\n"
+                    f"◈ **استخدام الكوبونات:** {cpn_info}\n"
+                    f"◈ **المتاح لهم:** {allowed_str}\n"
+                    f"──────────────────"
+                ),
                 inline=False
             )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -216,28 +411,89 @@ class StorePanelView(ui.View):
     async def buy_product(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_modal(BuyModal())
 
+    @ui.button(label="⭐ قيم منتجاتنا", style=discord.ButtonStyle.secondary, custom_id="btn_rate_product")
+    async def rate_product(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_modal(RateProductModal())
+
 class BuyModal(ui.Modal, title="💳 شراء منتج من المتجر"):
     code = ui.TextInput(label="كود المنتج (6 أرقام)", placeholder="مثال: 123456", required=True)
+    coupon = ui.TextInput(label="كود الخصم (اختياري)", placeholder="ادخل كود الكوبون إن وجد", required=False)
 
     async def on_submit(self, interaction: discord.Interaction):
         p_code = self.code.value.strip()
-        cursor.execute("SELECT name, item_type, role_id, price, duration_minutes FROM products WHERE code = ?", (p_code,))
+        c_code = self.coupon.value.strip() if self.coupon.value else None
+
+        cursor.execute("SELECT name, item_type, role_id, price, duration_minutes, allowed_users, status, allow_coupons, allowed_coupon_perc FROM products WHERE code = ?", (p_code,))
         prod = cursor.fetchone()
 
         if not prod:
             embed = discord.Embed(title="❌ خطأ", description="كود المنتج المدخل غير صحيح أو غير موجود.", color=0xE74C3C)
             return await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        p_name, p_type, r_id, price, dur = prod
-        _, _, _, coins = get_user_data(interaction.user.id)
+        p_name, p_type, r_id, price, dur, allowed, status, allow_cpn, req_cpn_perc = prod
 
-        if coins < price:
-            embed = discord.Embed(title="❌ رصيد غير كافٍ", description="لا تمتلك العملات الكافية لشراء هذا المنتج.", color=0xE74C3C)
+        # 1. فحص التوفر
+        if status != "available":
+            embed = discord.Embed(title="❌ غير متوفر", description="عذراً، هذا المنتج غير متوفر للشراء حالياً.", color=0xE74C3C)
             return await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        cursor.execute("UPDATE users SET coins = coins - ? WHERE user_id = ?", (price, interaction.user.id))
+        # 2. فحص الأشخاص المسموح لهم
+        if allowed != "ALL":
+            allowed_ids = [uid.strip() for uid in allowed.split(",")]
+            if str(interaction.user.id) not in allowed_ids:
+                embed = discord.Embed(title="❌ غير مصرح", description="عفواً، هذا المنتج مخصص لأشخاص محددين فقط.", color=0xE74C3C)
+                return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        # 3. منع شراء الرتب المكررة
+        if p_type == "role":
+            role = interaction.guild.get_role(r_id)
+            if role and role in interaction.user.roles:
+                embed = discord.Embed(
+                    title="❌ تمتلك الرتبة بالفعل",
+                    description=f"أنت تمتلك رتبة **{role.name}** بالفعل على حسابك، ولا يمكنك شراؤها مجدداً.",
+                    color=0xE74C3C
+                )
+                return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        # 4. معالجة وتدقيق الكوبونات والخصومات
+        discount_percent = 0
+        if c_code:
+            if allow_cpn == 0:
+                embed = discord.Embed(title="❌ غير مسموح بالخصم", description="عذراً، هذا المنتج غير قابل لتطبيق أي كوبونات خصم عليه.", color=0xE74C3C)
+                return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+            cursor.execute("SELECT discount FROM user_coupons WHERE code = ? AND user_id = ? AND is_used = 0", (c_code, interaction.user.id))
+            cpn_data = cursor.fetchone()
+            
+            if not cpn_data:
+                embed = discord.Embed(title="❌ كوبون غير صالح", description="كود الخصم المدخل غير صحيح أو تمت الاستفادة منه سابقاً.", color=0xE74C3C)
+                return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+            cpn_disc = cpn_data[0]
+            if req_cpn_perc > 0 and cpn_disc != req_cpn_perc:
+                embed = discord.Embed(
+                    title="❌ كوبون غير مطابق",
+                    description=f"هذا المنتج يتطلب حصراً كوبون خصم بمقدار `{req_cpn_perc}%` (الكوبون المدخل خصمه `{cpn_disc}%`).",
+                    color=0xE74C3C
+                )
+                return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+            discount_percent = cpn_disc
+
+        final_price = int(price * (100 - discount_percent) / 100)
+        _, _, _, coins, _, _ = get_user_data(interaction.user.id)
+
+        if coins < final_price:
+            embed = discord.Embed(title="❌ رصيد غير كافٍ", description=f"سعر المنتج المطلوبة بعد الخصم: `{final_price}` كوينز. رصيدك الحالي لا يكفي.", color=0xE74C3C)
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        # خصم المبلغ وحذف الكوبون المستخدم نهائياً منعاً للتكرار والجليتشات
+        cursor.execute("UPDATE users SET coins = coins - ? WHERE user_id = ?", (final_price, interaction.user.id))
+        if c_code:
+            cursor.execute("DELETE FROM user_coupons WHERE code = ?", (c_code,))
         conn.commit()
 
+        # تسليم المنتج
         if p_type == "role":
             role = interaction.guild.get_role(r_id)
             if role:
@@ -248,7 +504,7 @@ class BuyModal(ui.Modal, title="💳 شراء منتج من المتجر"):
                     conn.commit()
                 embed = discord.Embed(
                     title="🎉 │ عملية شراء ناجحة",
-                    description=f"تم شراء وإعطاء رتبة **{role.name}** بنجاح!\nخصم من رصيدك: `{price}` {CURRENCY_NAME}",
+                    description=f"تم شراء وإعطاء رتبة **{role.name}** بنجاح!\nالمبلغ المخصوم: `{final_price}` {CURRENCY_NAME}",
                     color=0x2ECC71
                 )
                 await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -269,7 +525,7 @@ class BuyModal(ui.Modal, title="💳 شراء منتج من المتجر"):
                     f"▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
                     f"📦 **المنتج:** `{p_name}`\n"
                     f"🔑 **الكود:** `{p_code}`\n"
-                    f"💰 **المبلغ المخصوم:** `{price}` {CURRENCY_NAME}\n"
+                    f"💰 **المبلغ المخصوم:** `{final_price}` {CURRENCY_NAME}\n"
                     f"▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
                     f"سيقوم <@&{ROLE_STORE_TEAM_ID}> بمساندتك واستلام التذكرة قريباً."
                 ),
@@ -284,270 +540,30 @@ class BuyModal(ui.Modal, title="💳 شراء منتج من المتجر"):
             )
             await interaction.response.send_message(embed=embed_user, ephemeral=True)
 
-        await log_event(interaction.guild, "عملية شراء", f"قام {interaction.user.mention} بشراء المنتج **{p_name}** بسعر `{price}` كوينز.")
+        await log_event(interaction.guild, "عملية شراء ناجحة", f"قام {interaction.user.mention} بشراء **{p_name}** بسعر `{final_price}` كوينز (خصم الكوبون: {discount_percent}%).")
 
-# --- عناصر التحكم داخل التيكت ---
-class TicketControlsView(ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @ui.button(label="استلام التذكرة ✋", style=discord.ButtonStyle.primary, custom_id="btn_claim_ticket")
-    async def claim(self, interaction: discord.Interaction, button: ui.Button):
-        if not any(r.id == ROLE_STORE_TEAM_ID for r in interaction.user.roles):
-            embed = discord.Embed(title="❌ غير مصرح", description="هذا الزر مخصص لفريق المتجر فقط.", color=0xE74C3C)
-            return await interaction.response.send_message(embed=embed, ephemeral=True)
-
-        embed = discord.Embed(
-            title="✋ │ تم استلام التذكرة",
-            description=f"قام الإداري {interaction.user.mention} بمسك واستلام هذه التذكرة.",
-            color=0x3498DB
-        )
-        await interaction.response.send_message(embed=embed)
-
-    @ui.button(label="إغلاق التذكرة 🔒", style=discord.ButtonStyle.danger, custom_id="btn_close_ticket")
-    async def close(self, interaction: discord.Interaction, button: ui.Button):
-        if not any(r.id == ROLE_STORE_TEAM_ID for r in interaction.user.roles):
-            embed = discord.Embed(title="❌ غير مصرح", description="هذا الزر مخصص لفريق المتجر فقط.", color=0xE74C3C)
-            return await interaction.response.send_message(embed=embed, ephemeral=True)
-
-        embed = discord.Embed(
-            title="🔒 │ إغلاق التذكرة",
-            description="سيتم حذف وحفظ التذكرة وإغلاق القناة خلال 5 ثوانٍ...",
-            color=0xE74C3C
-        )
-        await interaction.response.send_message(embed=embed)
-        await asyncio.sleep(5)
-        await interaction.channel.delete()
-
-# --- لوحة الإدارة ---
-class AdminPanelView(ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @ui.button(label="إدارة المنتجات 📦", style=discord.ButtonStyle.primary, custom_id="admin_prod")
-    async def manage_prod(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.send_modal(AddProductModal())
-
-    @ui.button(label="إدارة الكوينز 💰", style=discord.ButtonStyle.success, custom_id="admin_coins")
-    async def manage_coins(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.send_modal(ManageCoinsModal())
-
-    @ui.button(label="إدارة المستويات 📈", style=discord.ButtonStyle.secondary, custom_id="admin_lvl")
-    async def manage_level(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.send_modal(ManageLevelModal())
-
-    @ui.button(label="متطلبات ومكافأة الترقية ⚙️", style=discord.ButtonStyle.danger, custom_id="admin_reqs")
-    async def set_reqs(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.send_modal(SetLevelReqModal())
-
-class SetLevelReqModal(ui.Modal, title="⚙️ ضبط متطلبات ومكافأة المستوى"):
-    target_lvl = ui.TextInput(label="رقم المستوى (1-100)", placeholder="مثال: 5", required=True)
-    msgs = ui.TextInput(label="عدد الرسائل المطلوبة", placeholder="مثال: 50", required=True)
-    voice_mins = ui.TextInput(label="دقائق الفويس المطلوبة", placeholder="مثال: 120", required=True)
-    reward = ui.TextInput(label="مكافأة الوصول للمستوى (BX COINS)", placeholder="مثال: 1000", required=True)
+class RateProductModal(ui.Modal, title="⭐ تقييم منتجات المتجر"):
+    prod_info = ui.TextInput(label="اسم أو كود المنتج", placeholder="مثال: رتبة VIP أو 123456", required=True)
+    rating = ui.TextInput(label="التقييم من 1 إلى 5", placeholder="اكتب رقم من 1 إلى 5", required=True)
+    review = ui.TextInput(label="رأيك وسبب التقييم", placeholder="اكتب ملاحظاتك وتقييمك هنا...", style=discord.TextStyle.paragraph, required=True)
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
-            lvl = int(self.target_lvl.value)
-            m = int(self.msgs.value)
-            v = int(self.voice_mins.value)
-            r = int(self.reward.value)
-            if not (1 <= lvl <= 100):
-                raise ValueError
+            stars_num = int(self.rating.value)
+            if not (1 <= stars_num <= 5): raise ValueError
         except ValueError:
-            embed = discord.Embed(title="❌ خطأ", description="يرجى كتابة أرقام وقيم صحيحة.", color=0xE74C3C)
+            embed = discord.Embed(title="❌ خطأ", description="يرجى كتابة رقم تقييم صحيح بين 1 و 5.", color=0xE74C3C)
             return await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        cursor.execute("INSERT OR REPLACE INTO level_reqs VALUES (?, ?, ?, ?)", (lvl, m, v, r))
-        conn.commit()
+        stars_str = "⭐" * stars_num
+        ratings_channel = interaction.guild.get_channel(CHANNEL_RATINGS_ID)
 
-        embed = discord.Embed(
-            title="✅ │ تم حفظ متطلبات ومكافأة المستوى",
-            description=(
-                f"تم تحديث الشروط بنجاح لـ **Level {lvl}**:\n\n"
-                f"▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
-                f"💬 **الرسائل المطلوبة:** `{m}`\n"
-                f"🎙️ **دقائق الفويس:** `{v}` دقيقة\n"
-                f"🎁 **المكافأة:** `{r}` {CURRENCY_NAME}\n"
-                f"▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
-            ),
-            color=0x2ECC71
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        await log_event(interaction.guild, "تعديل شروط المستوى", f"تم تحديد شروط ومكافأة المستوى **{lvl}** بواسطة {interaction.user.mention}")
-
-class AddProductModal(ui.Modal, title="📦 إضافة منتج جديد للمتجر"):
-    p_name = ui.TextInput(label="اسم المنتج", placeholder="مثال: رتبة مميزة", required=True)
-    p_type = ui.TextInput(label="النوع (اركب role أم other)", placeholder="role أو other", required=True)
-    role_id = ui.TextInput(label="آي دي الرتبة (إذا كان role)", placeholder="اكتب الآي دي هنا أو اتركه فارغاً", required=False)
-    price = ui.TextInput(label="السعر (0 للمجاني)", placeholder="مثال: 500", required=True)
-    duration = ui.TextInput(label="المدة بالدقائق (0 للدائم)", placeholder="مثال: 1440 (ليوم واحد)", required=True)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        code = ''.join(random.choices(string.digits, k=6))
-        r_id = int(self.role_id.value) if self.role_id.value else 0
-        
-        cursor.execute("INSERT INTO products VALUES (?, ?, ?, ?, ?, ?)", 
-                       (code, self.p_name.value, self.p_type.value.lower(), r_id, int(self.price.value), int(self.duration.value)))
-        conn.commit()
-
-        embed = discord.Embed(
-            title="✅ │ تم إضافة المنتج بنجاح",
-            description=f"تم نشر المنتج **{self.p_name.value}** في المتجر.\n🔑 **الكود المختصر:** `{code}`",
-            color=0x2ECC71
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-class ManageCoinsModal(ui.Modal, title="💰 تعديل رصيد كوينز لاعب"):
-    target_id = ui.TextInput(label="آي دي العضو", placeholder="مثال: 123456789", required=True)
-    action = ui.TextInput(label="العملية (add أو remove)", placeholder="add أو remove", required=True)
-    amount = ui.TextInput(label="المبلغ", placeholder="مثال: 1000", required=True)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        uid = int(self.target_id.value)
-        amt = int(self.amount.value)
-        get_user_data(uid)
-
-        if self.action.value.lower() == "add":
-            cursor.execute("UPDATE users SET coins = coins + ? WHERE user_id = ?", (amt, uid))
-            act_text = "إضافة"
-        else:
-            cursor.execute("UPDATE users SET coins = coins - ? WHERE user_id = ?", (amt, uid))
-            act_text = "خصم"
-        conn.commit()
-
-        embed = discord.Embed(
-            title="✅ │ تم تعديل الرصيد",
-            description=f"تمت عملية {act_text} بمقدار `{amt}` {CURRENCY_NAME} للحساب <@{uid}>.",
-            color=0x2ECC71
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-class ManageLevelModal(ui.Modal, title="📈 تعديل مستوى لاعب يدوي"):
-    target_id = ui.TextInput(label="آي دي العضو", placeholder="مثال: 123456789", required=True)
-    new_lvl = ui.TextInput(label="المستوى الجديد (1-100)", placeholder="مثال: 10", required=True)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        uid = int(self.target_id.value)
-        lvl = int(self.new_lvl.value)
-        get_user_data(uid)
-
-        cursor.execute("UPDATE users SET level = ? WHERE user_id = ?", (lvl, uid))
-        conn.commit()
-
-        embed = discord.Embed(
-            title="✅ │ تم تعديل المستوى",
-            description=f"تم تغيير مستوى العضو <@{uid}> يدويّاً إلى **Level {lvl}**.",
-            color=0x2ECC71
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# ==================== الأوامر والمهام الدوريات ====================
-
-@bot.event
-async def on_ready():
-    bot.add_view(UserPanelView())
-    bot.add_view(StorePanelView())
-    bot.add_view(AdminPanelView())
-    bot.add_view(TicketControlsView())
-    voice_tracker.start()
-    temp_role_checker.start()
-    print(f"Logged in successfully as {bot.user}")
-
-@bot.event
-async def on_message(message):
-    if message.author.bot or not message.guild:
-        return
-
-    if any(r.id == ROLE_MEMBER_ID for r in message.author.roles):
-        cursor.execute("INSERT INTO users (user_id, messages) VALUES (?, 1) ON CONFLICT(user_id) DO UPDATE SET messages = messages + 1", (message.author.id,))
-        conn.commit()
-        await check_level_up(message.author, message.channel)
-
-    await bot.process_commands(message)
-
-@tasks.loop(minutes=1)
-async def voice_tracker():
-    for guild in bot.guilds:
-        for vc in guild.voice_channels:
-            for member in vc.members:
-                if not member.bot and any(r.id == ROLE_MEMBER_ID for r in member.roles):
-                    cursor.execute("INSERT INTO users (user_id, voice_minutes) VALUES (?, 1) ON CONFLICT(user_id) DO UPDATE SET voice_minutes = voice_minutes + 1", (member.id,))
-                    conn.commit()
-                    await check_level_up(member)
-
-@tasks.loop(minutes=1)
-async def temp_role_checker():
-    now = datetime.datetime.utcnow().isoformat()
-    cursor.execute("SELECT user_id, role_id FROM temp_roles WHERE expire_time <= ?", (now,))
-    expired = cursor.fetchall()
-    
-    for uid, rid in expired:
-        for guild in bot.guilds:
-            member = guild.get_member(uid)
-            role = guild.get_role(rid)
-            if member and role:
-                await member.remove_roles(role)
-                await log_event(guild, "انتهاء صلاحية رتبة", f"تم سحب رتبة **{role.name}** تلقائياً من {member.mention} لانتهاء مدتها.")
-        cursor.execute("DELETE FROM temp_roles WHERE user_id = ? AND role_id = ?", (uid, rid))
-    conn.commit()
-
-# ==================== أوامر إحضار اللوحات المنفصلة ====================
-
-# 1. أمر لوحة الأعضاء
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setup_user(ctx):
-    await ctx.message.delete()
-    embed = discord.Embed(
-        title="🌐 │ لوحة خدمات الأعضاء والتفاعل",
-        description=(
-            "مرحباً بكم في لوحة الأعضاء التفاعلية!\n"
-            "يمكنك استخدام الأزرار أدناه للاستعلام عن حسابك، متابعة مستواك، أو تحويل الكوينز.\n\n"
-            "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
-            "💰 **استعلام عن الرصيد:** لمعرفة رصيدك الحقيقي.\n"
-            "📊 **المستوى والتفاعل:** لعرض مستواك والرسائل ودقائق الصوتي.\n"
-            "💸 **تحويل عملات:** لتحويل BX COINS لأصدقائك."
-        ),
-        color=0x3498DB
-    )
-    await ctx.send(embed=embed, view=UserPanelView())
-
-# 2. أمر لوحة المتجر
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setup_store(ctx):
-    await ctx.message.delete()
-    embed = discord.Embed(
-        title="🛒 │ متجر السيرفر الرسمي (BX Store)",
-        description=(
-            "أهلاً بكم في متجر السيرفر!\n"
-            "استعرض المنتجات المتاحة واشترِ الرولات والخدمات باستخدام العملات.\n\n"
-            "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
-            "🛍️ **عرض المنتجات:** لاستعراض كافة السلع وأكوادها لـ 6 أرقام.\n"
-            "💳 **شراء منتج:** لإدخال كود السلعة وإتمام الشراء فورياً."
-        ),
-        color=0xF1C40F
-    )
-    await ctx.send(embed=embed, view=StorePanelView())
-
-# 3. أمر لوحة الإدارة
-@bot.command()
-@commands.has_permissions(administrator=True)
-async def setup_admin(ctx):
-    await ctx.message.delete()
-    embed = discord.Embed(
-        title="⚙️ │ لوحة الإدارة والتحكم",
-        description=(
-            "اللوحة الخاصة بطاقم إدارة السيرفر والمتجر.\n\n"
-            "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬\n"
-            "📦 **إدارة المنتجات:** لإضافة منتجات ورولات جديدة للبيع.\n"
-            "💰 **إدارة الكوينز:** لإضافة أو خصم الكوينز من الأعضاء.\n"
-            "📈 **إدارة المستويات:** لترقية أو تخفيض ليفل لاعب يدوياً.\n"
-            "⚙️ **متطلبات ومكافأة الترقية:** لتحديد شروط ومكافأة كل مستوى."
-        ),
-        color=0xE74C3C
-    )
-    await ctx.send(embed=embed, view=AdminPanelView())
-
+        if ratings_channel:
+            embed_review = discord.Embed(
+                title="🌟 │ تقييم مراجعة جديد للمتجر",
+                description=(
+                    f"👤 **صاحب التقييم:** {interaction.user.mention}\n"
+                    f"📦 **المنتج:** `{self.prod_info.value}`\n"
+                    f"⭐ **التقييم:** {stars_str} (`{stars_num}/5`)\n\n"
+                    f"📝 **الرأي والتفاصيل:**\n```{self.review.value}
 bot.run(os.getenv("DISCORD_TOKEN"))
