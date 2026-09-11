@@ -639,58 +639,80 @@ class AdminPanelView(ui.View):
     async def add_product(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_modal(AdminAddProductModal())
 
-# ==================== أوامر إرسال اللوحات ====================
+# ==================== الأحداث والتسجيل ====================
+
+@bot.event
+async def on_ready():
+    bot.add_view(UserPanelView())
+    bot.add_view(StorePanelView())
+    bot.add_view(TicketControlsView())
+    bot.add_view(AdminPanelView())
+    
+    if not check_temp_roles.is_running():
+        check_temp_roles.start()
+
+    print(f"✅ تم تشغيل البوت بنجاح باسم: {bot.user}")
+
+@bot.event
+async def on_message(message):
+    if message.author.bot or not message.guild:
+        return
+
+    user_id = message.author.id
+    get_user_data(user_id)
+
+    cursor.execute("UPDATE users SET messages = messages + 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+
+    await check_level_up(message.author, message.channel)
+    await bot.process_commands(message)
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member.bot: return
+
+    user_id = member.id
+    now = datetime.datetime.utcnow()
+
+    if before.channel is None and after.channel is not None:
+        voice_tracking[user_id] = now
+    elif before.channel is not None and after.channel is None:
+        join_time = voice_tracking.pop(user_id, None)
+        if join_time:
+            mins = int((now - join_time).total_seconds() / 60)
+            if mins > 0:
+                get_user_data(user_id)
+                cursor.execute("UPDATE users SET voice_minutes = voice_minutes + ? WHERE user_id = ?", (mins, user_id))
+                conn.commit()
+                await check_level_up(member)
+
+# ==================== أوامر إرسال اللوحات (بدون قيود للأونر) ====================
 
 @bot.command()
 async def setup_store(ctx):
     embed = discord.Embed(
-        title="🛒 | متجر Brevix الرسمي",
-        description="أهلاً بك في المتجر! اضغط على الأزرار أدناه للاستعراض والشراء.",
+        title="🛍️ │ متجر Brevix الرسمي",
+        description="مرحباً بك في المتجر! اضغط على الأزرار أدناه للاستعراض والشراء.",
         color=0xF1C40F
     )
-    # استخدام أزرار بسيطة مباشرة لو الكلاس فيه مشكلة، أو استدعاء الكلاس لو شغال
-    try:
-        view = StorePanelView()
-    except Exception:
-        view = None
-    await ctx.send(embed=embed, view=view)
+    await ctx.send(embed=embed, view=StorePanelView())
 
 @bot.command()
 async def setup_user(ctx):
     embed = discord.Embed(
-        title="👤 | لوحة خدمات الأعضاء",
+        title="👤 │ لوحة خدمات الأعضاء",
         description="استخدم الأزرار أدناه للتحكم بملفك الشخصي وعجلة الحظ.",
         color=0x3498DB
     )
-    try:
-        view = UserPanelView()
-    except Exception:
-        view = None
-    await ctx.send(embed=embed, view=view)
+    await ctx.send(embed=embed, view=UserPanelView())
 
 @bot.command()
 async def setup_admin(ctx):
     embed = discord.Embed(
-        title="⚙️ | لوحة التحكم الإدارية",
+        title="⚙️ │ لوحة التحكم الإدارية",
         description="استخدم الأزرار أدناه لإدارة رصيد الأعضاء وإضافة المنتجات.",
         color=0xE74C3C
     )
-    try:
-        view = AdminPanelView()
-    except Exception:
-        view = None
-    await ctx.send(embed=embed, view=view)
-
-@bot.command()
-async def ping(ctx):
-    await ctx.send("Pong! 🏓 البوت شغال وبيستجيب للأوامر.")
-
-@bot.event
-async def on_command_error(ctx, error):
-    await ctx.send(f"❌ خطأ غير مرئي: {error}")
-
-@bot.command()
-async def test(ctx):
-    await ctx.send("الأمر شغال تمام!")
+    await ctx.send(embed=embed, view=AdminPanelView())
 
 bot.run(os.getenv("DISCORD_TOKEN"))
