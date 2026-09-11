@@ -686,8 +686,6 @@ async def on_voice_state_update(member, before, after):
                 conn.commit()
                 await check_level_up(member)
 
-# ==================== أوامر إرسال اللوحات ====================
-
 @bot.command()
 async def setup_store(ctx):
     embed = discord.Embed(
