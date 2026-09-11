@@ -719,10 +719,7 @@ async def ping(ctx):
 
 @bot.event
 async def on_command_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("❌ **خطأ:** تحتاج صلاحية Administrator لتنفيذ هذا الأمر.")
-    else:
-        await ctx.send(f"❌ **حدث خطأ:** `{error}`")
+    await ctx.send(f"❌ خطأ غير مرئي: {error}")
 
 @bot.command()
 async def test(ctx):
